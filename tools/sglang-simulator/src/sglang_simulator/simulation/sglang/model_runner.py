@@ -15,6 +15,19 @@ class _MockModel(torch.nn.Module):
         return None
 
 
+class _MockDFlashModel(_MockModel):
+    """Model attributes used by DFlash initialization and pool sizing."""
+
+    candidate_selector = None
+    lilicorr = None
+
+    def set_block_size(self, block_size):
+        self.block_size = block_size
+
+    def set_dflash_layers_to_capture(self, layer_ids):
+        pass
+
+
 class _MockModelLoader:
     """Minimal loader state for upstream resident-weight accounting."""
 
@@ -46,7 +59,11 @@ class C_ModelRunnerHook(BaseHook):
                 resolve_sliding_window_size,
             )
 
-            self.model = _MockModel()
+            self.model = (
+                _MockDFlashModel()
+                if self.server_args.speculative_algorithm == "DFLASH"
+                else _MockModel()
+            )
             self.dtype = self.model_config.dtype
             self.sliding_window_size = resolve_sliding_window_size(
                 self.model, self.model_config

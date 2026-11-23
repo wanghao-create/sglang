@@ -8,12 +8,15 @@ os.environ["SGLANG_SIMULATOR_BOOTSTRAP"] = "1"
 import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,
+    dflash,
     hicache_storage,
     mem_cache_allocator,
     mem_pool_host,
     model_runner,
     scheduler,
     sgl_kernel_hook,
+    speculative,
+    standalone,
     unified_radix_cache,
 )
 
@@ -42,6 +45,9 @@ def install_simulator_hooks() -> None:
             scheduler.C_SchedulerRequestReceiver,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
+            standalone.C_StandaloneWorkerHook,
+            dflash.C_DFlashWorkerHook,
+            speculative.C_SpeculativeKVPoolHook,
             hicache_storage.C_StorageBackendFactory,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,

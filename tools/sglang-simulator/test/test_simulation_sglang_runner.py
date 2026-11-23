@@ -1,3 +1,4 @@
+import asyncio
 import atexit
 import json
 import os
@@ -5,6 +6,7 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from sglang_simulator.dataset import GenericRequest, SimpleDataset
 from sglang_simulator.simulation.benchmark import BenchmarkConfig
 
@@ -116,3 +118,139 @@ def test_benchmark_sglang_runs_paged_decode(tmp_path):
     assert all(
         idx == 0 or req["created_time"] > 0 for idx, req in enumerate(request_stats)
     )
+
+
+@pytest.mark.parametrize("algorithm", ["STANDALONE", "DFLASH"])
+def test_speculative_commits_and_completion(monkeypatch, tmp_path, algorithm):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("SGLANG_USE_CPU_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_DIR", str(tmp_path / "output"))
+    config_path = tmp_path / "sim.json"
+    table_path = tmp_path / "replay.json"
+    step_shapes = [
+        [[12, 0]] * 3,
+        [[1, 12]] * 3,
+        [[1, 13], [1, 14], [1, 16]],
+        [[1, 14], [1, 16]],
+        [[1, 15], [1, 18]],
+        [[1, 16]],
+        [[1, 17]],
+        [[1, 18]],
+    ]
+    table_path.write_text(
+        json.dumps({json.dumps(shape): 0.02 for shape in step_shapes})
+    )
+    config_path.write_text(
+        json.dumps(
+            {
+                "platform": {
+                    "accelerator": {"name": "a100_sxm", "hbm_capacity_gb": 80},
+                    "disk_read_bandwidth_gb": 8,
+                    "disk_write_bandwidth_gb": 8,
+                    "memory_read_bandwidth_gb": 64,
+                    "memory_write_bandwidth_gb": 64,
+                    "num_device_per_node": 1,
+                },
+                "predictor": {
+                    "name": "replay",
+                    "database_path": str(table_path),
+                },
+                algorithm.lower(): {
+                    "accepted_draft_tokens": 0,
+                    "acceptance_by_request": {"partial": [1] * 4, "full": [3, 3]},
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", str(config_path))
+
+    from sglang_simulator.compat import apply_simulator_server_args
+    from sglang_simulator.simulation.sglang.engine import SGLangSimulationEngine
+
+    args = dict(
+        model_path=str(ASSETS / "qwen3-8b"),
+        speculative_draft_model_path=str(ASSETS / "qwen3-8b"),
+        speculative_algorithm=algorithm,
+        speculative_num_steps=3,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=4,
+        device="cpu",
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        disable_radix_cache=True,
+        max_total_tokens=256,
+        context_length=128,
+        page_size=1,
+    )
+    if algorithm == "DFLASH":
+        draft = tmp_path / "draft"
+        draft.mkdir()
+        config = json.loads((ASSETS / "qwen3-8b" / "config.json").read_text())
+        config.update(
+            architectures=["DFlashDraftModel"],
+            num_hidden_layers=1,
+            block_size=4,
+            dflash_config={"mask_token_id": 10, "target_layer_ids": [1]},
+        )
+        (draft / "config.json").write_text(json.dumps(config))
+        args["speculative_draft_model_path"] = str(draft)
+        args.pop("speculative_num_steps")
+        args.pop("speculative_eagle_topk")
+    apply_simulator_server_args(args)
+    engine = SGLangSimulationEngine(**args)
+    expected_verify_counts = {"zero": 7, "partial": 4, "full": 2}
+
+    async def run():
+        await engine.tokenizer_manager.start_profile()
+        results = await asyncio.gather(
+            *(
+                engine.async_generate(
+                    rid=rid,
+                    input_ids=[11 + index] * 12,
+                    sampling_params={
+                        "temperature": 0,
+                        "max_new_tokens": 8,
+                        "ignore_eos": True,
+                        "custom_params": {
+                            "simulation": {"total_request": 3, "created_time": 0}
+                        },
+                    },
+                )
+                for index, rid in enumerate(expected_verify_counts)
+            )
+        )
+        await engine.tokenizer_manager.stop_profile()
+        return results
+
+    try:
+        responses = engine.loop.run_until_complete(run())
+    finally:
+        engine.shutdown()
+
+    assert all(len(response["output_ids"]) == 8 for response in responses)
+    assert {
+        response["meta_info"]["id"]: response["meta_info"]["spec_verify_ct"]
+        for response in responses
+    } == expected_verify_counts
+    output = tmp_path / "output"
+    requests = {
+        row["rid"]: row
+        for row in map(json.loads, (output / "request.jsonl").read_text().splitlines())
+    }
+    assert set(requests) == set(expected_verify_counts)
+    for rid, verify_rounds in expected_verify_counts.items():
+        stats = requests[rid]
+        assert stats["output_length"] == 8
+        assert len(stats["gen_token_latencies"]) == 8
+        assert (
+            sum(latency > 0 for latency in stats["gen_token_latencies"])
+            == verify_rounds + 1
+        )
+    iterations = list(
+        map(json.loads, (output / "iteration.jsonl").read_text().splitlines())
+    )
+    assert [sorted(row["requests"]) for row in iterations] == step_shapes
+    metrics = json.loads((output / "metrics.json").read_text())
+    assert metrics["replay_exact_match_steps"] == len(step_shapes)
+    assert metrics["replay_miss_steps"] == 0

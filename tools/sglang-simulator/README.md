@@ -201,6 +201,48 @@ integration, see
 process/HTTP path, see
 [`test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py).
 
+## Speculative decoding
+
+The simulator supports synchronous fixed-width verification for `STANDALONE`
+and plain `DFLASH`. Pass the corresponding SGLang draft model options to the
+simulator launcher. For a standalone draft, use a fixed `top-k=1` chain with
+`speculative_num_draft_tokens = speculative_num_steps + 1`.
+
+~~~text
+--speculative-algorithm STANDALONE --speculative-draft-model-path /path/to/draft
+--speculative-num-steps 3 --speculative-eagle-topk 1
+--speculative-num-draft-tokens 4 --disable-overlap-schedule
+~~~
+
+For DFlash, give the supported fixed block width and use full draft KV.
+
+~~~text
+--speculative-algorithm DFLASH --speculative-draft-model-path /path/to/dflash-draft
+--speculative-num-draft-tokens 16 --disable-overlap-schedule
+~~~
+
+Use the top-level `standalone` or `dflash` section to configure accepted draft
+tokens. This example uses the DFlash section.
+
+~~~json
+{
+  "dflash": {
+    "accepted_draft_tokens": 0,
+    "acceptance_by_request": {"request-1": [0, 2, 3]}
+  }
+}
+~~~
+
+Each count excludes the bonus token and ranges from zero to one less than the
+verify width. Missing or exhausted traces use `accepted_draft_tokens`, which
+defaults to zero. An acceptance sampler such as MTPSim can supply per-request
+traces. The native scheduler applies stopping rules to each round's commits.
+
+Calibrate timing using the same target, draft and block width. With Replay,
+prefill entries represent the complete speculative prefill. A decode entry
+with `extend_length=1` and the currently committed KV length represents the
+complete draft and verification round, including draft KV updates.
+
 ## Simulation modes
 
 | Mode | Behavior |
@@ -216,7 +258,7 @@ so the printed table and `benchmark.json` are sourced from the current run's
 
 ## Configuration
 
-A simulator configuration has three sections:
+A basic simulator configuration looks like this:
 
 ```json
 {

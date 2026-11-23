@@ -47,10 +47,18 @@ def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
     if isinstance(target, dict):
         target.update(SIMULATOR_SERVER_ARG_OVERRIDES)
-        return
+        algorithm = target.get("speculative_algorithm")
+    else:
+        for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
+            setattr(target, name, value)
+        algorithm = getattr(target, "speculative_algorithm", None)
 
-    for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
-        setattr(target, name, value)
+    if algorithm == "DFLASH":
+        from sglang_simulator.simulation.sglang.dflash import (
+            install_dflash_resolution_hook,
+        )
+
+        install_dflash_resolution_hook()
 
 
 def validate_simulator_server_args(server_args) -> None:

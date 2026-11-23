@@ -15,6 +15,7 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.speculative import SIMULATED_SPEC_ALGORITHMS
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -315,6 +316,21 @@ class C_SchedulerHook(BaseHook):
             )
             original_init(self, *args, **kwargs)
             validate_required_class_hooks()
+            if self.spec_algorithm.name in SIMULATED_SPEC_ALGORITHMS:
+                from sglang_simulator.simulation.sglang.dflash import C_DFlashWorkerHook
+                from sglang_simulator.simulation.sglang.standalone import (
+                    C_StandaloneWorkerHook,
+                )
+
+                worker_hook = {
+                    "STANDALONE": C_StandaloneWorkerHook,
+                    "DFLASH": C_DFlashWorkerHook,
+                }[self.spec_algorithm.name]
+                if not is_class_hook_matched(worker_hook):
+                    raise RuntimeError(
+                        f"{self.spec_algorithm.name} simulation requires "
+                        f"SGLang's {worker_hook.HOOK_CLASS_NAME}."
+                    )
             if original_recv_requests is None and not is_class_hook_matched(
                 C_SchedulerRequestReceiver
             ):
@@ -435,11 +451,20 @@ class C_SchedulerHook(BaseHook):
                             )
                         )
                 elif batch.forward_mode.is_decode():
+                    simulated_speculation = (
+                        self.spec_algorithm.name in SIMULATED_SPEC_ALGORITHMS
+                    )
                     for req in batch.reqs:
+                        # A speculative decode prediction covers one complete
+                        # draft/verify round at the current committed KV length.
+                        past_kv_length = (
+                            req.kv.kv_committed_len
+                            if simulated_speculation
+                            else req.prefix_len + len(req.output_ids)
+                        )
                         simulation_batch.reqs.append(
                             ScheduleRequest(
-                                extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                                extend_length=1, past_kv_length=past_kv_length
                             )
                         )
 
@@ -473,13 +498,25 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
+            batch = get_obj_from_args(
+                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
+            )
+            visible_before = None
+            if (
+                batch is not None
+                and self.spec_algorithm.name in SIMULATED_SPEC_ALGORITHMS
+            ):
+                from sglang.srt.managers.scheduler_components.batch_result_processor import (
+                    SchedulerBatchResultProcessor,
+                )
+
+                visible = SchedulerBatchResultProcessor._visible_output_len
+                visible_before = {req.rid: visible(req) for req in batch.reqs}
+
             process_batch_result_start = time.perf_counter()
             ret = original_process_batch_result(self, *args, **kwargs)
             process_batch_result_end = time.perf_counter()
 
-            batch = get_obj_from_args(
-                "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
-            )
             if batch is not None:
                 if len(batch.reqs) == 0:
                     return ret
@@ -511,18 +548,22 @@ class C_SchedulerHook(BaseHook):
                 StateManager.set_last_real_time_ts(now)
 
                 request_response_time = StateManager.get_global_clock()
-                # Request statistics
+                # A speculative round can expose several tokens at one time.
                 for req in batch.reqs:
-                    if len(req.output_ids) != 0:  # not chunked
+                    if visible_before is None:
+                        emitted = int(bool(req.output_ids))
+                    else:
+                        emitted = visible(req) - visible_before[req.rid]
+                    if emitted > 0:
                         req_stats = request_stats_manager.get_req_stats(req.rid)
                         req_stats.gen_token_latencies.append(
-                            request_response_time
-                            - req_stats.last_event_time  # queue duration
+                            request_response_time - req_stats.last_event_time
                         )
                         req_stats.last_event_time = request_response_time
-                    else:
-                        # Chunked request: nothing to do
-                        pass
+                        if visible_before is not None:
+                            req_stats.gen_token_latencies.extend([0.0] * (emitted - 1))
+                            if req.finished():
+                                req_stats.output_length = visible(req)
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
