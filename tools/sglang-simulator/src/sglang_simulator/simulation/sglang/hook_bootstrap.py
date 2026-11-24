@@ -59,6 +59,8 @@ def install_simulator_hooks() -> None:
             mem_pool_host.C_GenericHostKVCacheSubclassHook,
         ]
     )
+    sgl_kernel_hook.install_cpu_kv_slot_fallback()
+    dflash.install_dflash_resolution_hook()
     _HOOKS_INSTALLED = True
 
 

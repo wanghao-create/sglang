@@ -51,10 +51,7 @@ class ConfigManager:
 
     @classmethod
     def get_speculative_config(cls, algorithm: str) -> dict:
-        config = cls._get_raw_config().get(algorithm, {})
-        if not isinstance(config, dict):
-            raise ValueError(f"{algorithm} must be an object")
-        return config
+        return cls._get_raw_config().get(algorithm.lower()) or {}
 
     @classmethod
     def reset_config_cache(cls):

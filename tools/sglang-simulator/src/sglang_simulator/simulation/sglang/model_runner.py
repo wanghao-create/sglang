@@ -61,7 +61,7 @@ class C_ModelRunnerHook(BaseHook):
 
             self.model = (
                 _MockDFlashModel()
-                if self.server_args.speculative_algorithm == "DFLASH"
+                if (self.server_args.speculative_algorithm or "").upper() == "DFLASH"
                 else _MockModel()
             )
             self.dtype = self.model_config.dtype
@@ -73,7 +73,9 @@ class C_ModelRunnerHook(BaseHook):
             self.load_config = None
             self.loader = _make_mock_model_loader(type(self))
 
-            if ConfigManager.get_model_info() is None:
+            if ConfigManager.get_model_info() is None and not getattr(
+                self, "is_draft_worker", False
+            ):
                 ConfigManager.set_model_info(resolve_model_info(self.model_config))
 
         def wrapped_forward(self, *args, **kwargs):

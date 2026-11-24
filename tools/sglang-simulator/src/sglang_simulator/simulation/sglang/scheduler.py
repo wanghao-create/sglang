@@ -15,7 +15,10 @@ from sglang_simulator.hook import (
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
-from sglang_simulator.simulation.sglang.speculative import SIMULATED_SPEC_ALGORITHMS
+from sglang_simulator.simulation.sglang.speculative import (
+    SIMULATED_SPEC_ALGORITHMS,
+    validate_speculative_hooks,
+)
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
     resolve_scheduler_config,
@@ -316,21 +319,7 @@ class C_SchedulerHook(BaseHook):
             )
             original_init(self, *args, **kwargs)
             validate_required_class_hooks()
-            if self.spec_algorithm.name in SIMULATED_SPEC_ALGORITHMS:
-                from sglang_simulator.simulation.sglang.dflash import C_DFlashWorkerHook
-                from sglang_simulator.simulation.sglang.standalone import (
-                    C_StandaloneWorkerHook,
-                )
-
-                worker_hook = {
-                    "STANDALONE": C_StandaloneWorkerHook,
-                    "DFLASH": C_DFlashWorkerHook,
-                }[self.spec_algorithm.name]
-                if not is_class_hook_matched(worker_hook):
-                    raise RuntimeError(
-                        f"{self.spec_algorithm.name} simulation requires "
-                        f"SGLang's {worker_hook.HOOK_CLASS_NAME}."
-                    )
+            validate_speculative_hooks(self.spec_algorithm)
             if original_recv_requests is None and not is_class_hook_matched(
                 C_SchedulerRequestReceiver
             ):

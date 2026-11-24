@@ -1,78 +1,82 @@
-"""Shared acceptance and KV accounting for simulated verification rounds."""
+"""Shared acceptance and KV accounting for simulated speculative decoding."""
 
-from functools import wraps
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
-from sglang_simulator.hook import BaseHook
+from sglang_simulator.hook import BaseHook, is_class_hook_matched
 from sglang_simulator.simulation.manager import ConfigManager
 
 SIMULATED_SPEC_ALGORITHMS = ("STANDALONE", "DFLASH")
 
 
-def acceptance_config(algorithm, max_accepted):
+def _validate_accepted_count(
+    value: Any, max_accepted: int, label: str
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= max_accepted:
+        raise ValueError(f"{label} must be an integer in [0, {max_accepted}], got {value!r}")
+    return int(value)
+
+
+def acceptance_config(
+    algorithm: str, max_accepted: int
+) -> tuple[int, Mapping[str, Sequence[int]]]:
     config = ConfigManager.get_speculative_config(algorithm)
-    default = config.get("accepted_draft_tokens", 0)
-    traces = config.get("acceptance_by_request", {})
-    if type(default) is not int or not 0 <= default <= max_accepted:
-        raise ValueError(
-            f"{algorithm}.accepted_draft_tokens must be in [0, {max_accepted}]"
-        )
-    if not isinstance(traces, dict) or any(
-        not isinstance(trace, list)
-        or any(type(n) is not int or not 0 <= n <= max_accepted for n in trace)
-        for trace in traces.values()
-    ):
-        raise ValueError(
-            f"{algorithm}.acceptance_by_request must map request IDs to lists "
-            f"of integers in [0, {max_accepted}]"
-        )
+    default = _validate_accepted_count(
+        config.get("accepted_draft_tokens", 0),
+        max_accepted,
+        f"{algorithm}.accepted_draft_tokens",
+    )
+    traces = config.get("acceptance_by_request") or {}
     return default, traces
 
 
-def _assign_cpu_kv_slots(req_indices, req_to_token, starts, ends, slots, _width):
-    offset = 0
-    for index, start, end in zip(req_indices.tolist(), starts.tolist(), ends.tolist()):
-        length = end - start
-        req_to_token[index, start:end] = slots[offset : offset + length]
-        offset += length
+def validate_speculative_hooks(spec_algorithm: Any) -> None:
+    if spec_algorithm.name not in SIMULATED_SPEC_ALGORITHMS:
+        return
+
+    from sglang_simulator.simulation.sglang.dflash import C_DFlashWorkerHook
+    from sglang_simulator.simulation.sglang.standalone import C_StandaloneWorkerHook
+
+    worker_hook = {
+        "STANDALONE": C_StandaloneWorkerHook,
+        "DFLASH": C_DFlashWorkerHook,
+    }[spec_algorithm.name]
+    if not is_class_hook_matched(worker_hook):
+        raise RuntimeError(
+            f"{spec_algorithm.name} simulation requires "
+            f"SGLang's {worker_hook.HOOK_CLASS_NAME}."
+        )
 
 
 class C_SpeculativeKVPoolHook(BaseHook):
-    REQUIRED = False
     HOOK_CLASS_NAME = "MHATokenToKVPool"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.memory_pool"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):
-        original_warmup = getattr(target, "_init_kv_copy_and_warmup", None)
-        if original_warmup is None:
+        original_init_kv_copy_and_warmup = getattr(
+            target, "_init_kv_copy_and_warmup", None
+        )
+        if original_init_kv_copy_and_warmup is None:
             return
 
-        @wraps(original_warmup)
-        def warmup(self):
+        def wrapped_init_kv_copy_and_warmup(self):
             from sglang.srt.runtime_context import get_spec
 
-            if (
-                torch.device(self.device).type == "cpu"
-                and get_spec().speculative_algorithm in SIMULATED_SPEC_ALGORITHMS
-            ):
-                # The simulated worker does not copy numeric KV payloads.
+            if get_spec().speculative_algorithm in SIMULATED_SPEC_ALGORITHMS:
+                # Simulated speculative workers do not copy numeric KV payloads.
                 self._kv_copy_config = None
                 return
-            return original_warmup(self)
+            return original_init_kv_copy_and_warmup(self)
 
-        target._init_kv_copy_and_warmup = warmup
-
-
-def install_cpu_kv_slot_fallback():
-    # Preserve native allocation with CUDA-only kernel wheels.
-    if not hasattr(torch.ops.sgl_kernel, "assign_req_to_token_pool_cpu"):
-        from sglang.srt.mem_cache import allocation
-
-        allocation.assign_req_to_token_pool_cpu = _assign_cpu_kv_slots
+        target._init_kv_copy_and_warmup = wrapped_init_kv_copy_and_warmup
 
 
-def simulate_speculative_batch(worker, batch):
+def simulate_speculative_batch(worker: Any, batch: Any):
     from sglang.srt.managers.utils import GenerationBatchResult
 
     if batch.forward_mode.is_extend():
@@ -81,14 +85,24 @@ def simulate_speculative_batch(worker, batch):
         return result, result.next_token_ids.to(torch.int32)
 
     default, traces = worker._simulated_acceptance
+    width = worker.speculative_num_draft_tokens
+    max_accepted = width - 1
     commits = []
     for req in batch.reqs:
         trace = traces.get(req.rid, ())
         step = req.spec_verify_ct
-        commits.append(1 + (trace[step] if step < len(trace) else default))
+        if step < len(trace):
+            accepted = _validate_accepted_count(
+                trace[step],
+                max_accepted,
+                f"acceptance_by_request[{req.rid!r}][{step}]",
+            )
+        else:
+            accepted = default
+        commits.append(1 + accepted)
+
     accept_lens = torch.tensor(commits, dtype=torch.int32, device=worker.device)
     bonus_tokens = torch.ones(len(commits), dtype=torch.int32, device=worker.device)
-    width = worker.speculative_num_draft_tokens
     result = GenerationBatchResult(
         next_token_ids=bonus_tokens.repeat_interleave(width),
         accept_lens=accept_lens,

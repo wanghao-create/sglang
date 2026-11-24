@@ -1,99 +1,99 @@
 """Simulate accepted drafts in the native synchronous DFlash worker."""
 
-from contextvars import ContextVar
-from functools import cache, wraps
+from __future__ import annotations
 
-import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.sglang.speculative import (
     acceptance_config,
-    install_cpu_kv_slot_fallback,
     simulate_speculative_batch,
 )
 
+_RESOLUTION_HOOK_INSTALLED = False
 
-@cache
-def install_dflash_resolution_hook():
-    from sglang.srt.arg_groups import speculative_hook
-    from sglang.srt.arg_groups.model_override_base import resolving_view
-    from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
 
-    # Advertise simulation capabilities only to the DFlash argument resolver.
-    # The scheduler and the platform's device operations still run on CPU.
-    cpu_dflash = ContextVar("cpu_dflash_simulation", default=False)
-    platform = speculative_hook.current_platform
-    capabilities = {
-        "is_out_of_tree": lambda: True,
-        "supports_speculative_algorithm": lambda algorithm: algorithm == "DFLASH",
-        "supports_speculative_draft_attention_backend": lambda algorithm, backend: (
-            algorithm == "DFLASH" and backend == "torch_native"
-        ),
-        "get_default_speculative_draft_attention_backend": lambda algorithm: (
-            "torch_native"
-        ),
-    }
+class _SimDFlashPlatform:
+    """Advertise simulated DFlash support only during ServerArgs resolution."""
 
-    class ResolutionPlatform:
-        def __getattr__(self, name):
-            if cpu_dflash.get() and name in capabilities:
-                return capabilities[name]
-            return getattr(platform, name)
+    def __init__(self, platform):
+        self._platform = platform
 
-    speculative_hook.current_platform = ResolutionPlatform()
+    def is_out_of_tree(self) -> bool:
+        return True
+
+    def supports_speculative_algorithm(self, algorithm: str) -> bool:
+        return algorithm == "DFLASH"
+
+    def supports_speculative_draft_attention_backend(
+        self, algorithm: str, backend: str
+    ) -> bool:
+        return algorithm == "DFLASH" and backend == "torch_native"
+
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        return "torch_native"
+
+    def __getattr__(self, name: str):
+        return getattr(self._platform, name)
+
+
+def install_dflash_resolution_hook() -> None:
+    """Register the simulated DFlash ServerArgs resolution hook once."""
+    global _RESOLUTION_HOOK_INSTALLED
+    if _RESOLUTION_HOOK_INSTALLED:
+        return
+
+    try:
+        from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
+    except ImportError:
+        return
 
     @register_resolution_hook("handle_speculative_decoding")
-    def resolve(server_args, previous):
+    def wrapped_handle_speculative_decoding(server_args, previous):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
         cfg = resolving_view(server_args)
-        simulated = cfg.speculative_algorithm == "DFLASH" and cfg.device == "cpu"
-        token = cpu_dflash.set(simulated)
+        if (cfg.speculative_algorithm or "").upper() != "DFLASH":
+            return previous(server_args)
+
+        from sglang.srt.arg_groups import speculative_hook
+
+        original_platform = speculative_hook.current_platform
+        speculative_hook.current_platform = _SimDFlashPlatform(original_platform)
         try:
-            previous(server_args)
+            return previous(server_args)
         finally:
-            cpu_dflash.reset(token)
+            speculative_hook.current_platform = original_platform
+
+    _RESOLUTION_HOOK_INSTALLED = True
 
 
 class C_DFlashWorkerHook(BaseHook):
-    REQUIRED = False
     HOOK_CLASS_NAME = "DFlashWorkerV2"
     HOOK_MODULE_NAME = "sglang.srt.speculative.dflash_worker_v2"
+    REQUIRED = False
 
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
-        original_forward = target.forward_batch_generation
-        original_merge = target._maybe_merge_trained_mask_embedding
 
-        @wraps(original_init)
-        def init(self, server_args, gpu_id, nccl_port, target_worker):
-            if torch.device(target_worker.device).type == "cpu":
-                from sglang.srt.runtime_context import get_spec
+        def wrapped_init(self, server_args, gpu_id, nccl_port, target_worker):
+            from sglang.srt.runtime_context import get_spec
 
-                if (
-                    not server_args.disable_overlap_schedule
-                    or get_spec().speculative_draft_window_size is not None
-                    or get_spec().speculative_dflash_draft_kv_ring
-                ):
-                    raise ValueError(
-                        "DFLASH simulation requires synchronous fixed-block verification "
-                        "with full draft KV"
-                    )
-            original_init(self, server_args, gpu_id, nccl_port, target_worker)
-            if torch.device(self.device).type == "cpu":
-                self._simulated_acceptance = acceptance_config(
-                    "dflash", self.speculative_num_draft_tokens - 1
+            if (
+                get_spec().speculative_draft_window_size is not None
+                or get_spec().speculative_dflash_draft_kv_ring
+            ):
+                raise ValueError(
+                    "DFLASH simulation requires fixed-block verification with full draft KV."
                 )
-                install_cpu_kv_slot_fallback()
+            original_init(self, server_args, gpu_id, nccl_port, target_worker)
+            self._simulated_acceptance = acceptance_config(
+                "dflash", self.speculative_num_draft_tokens - 1
+            )
 
-        @wraps(original_merge)
-        def merge_mask_embedding(self):
-            if torch.device(self.device).type != "cpu":
-                return original_merge(self)
+        def override_maybe_merge_trained_mask_embedding(self):
+            return None
 
-        @wraps(original_forward)
-        def forward(self, batch, *args, **kwargs):
-            if torch.device(self.device).type != "cpu":
-                return original_forward(self, batch, *args, **kwargs)
-
+        def override_forward_batch_generation(self, batch, *args, **kwargs):
             from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 
             result, bonus_tokens = simulate_speculative_batch(self, batch)
@@ -102,6 +102,8 @@ class C_DFlashWorkerHook(BaseHook):
             )
             return result
 
-        target.__init__ = init
-        target._maybe_merge_trained_mask_embedding = merge_mask_embedding
-        target.forward_batch_generation = forward
+        target.__init__ = wrapped_init
+        target._maybe_merge_trained_mask_embedding = (
+            override_maybe_merge_trained_mask_embedding
+        )
+        target.forward_batch_generation = override_forward_batch_generation

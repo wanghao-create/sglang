@@ -208,30 +208,30 @@ and plain `DFLASH`. Pass the corresponding SGLang draft model options to the
 simulator launcher. For a standalone draft, use a fixed `top-k=1` chain with
 `speculative_num_draft_tokens = speculative_num_steps + 1`.
 
-~~~text
+```text
 --speculative-algorithm STANDALONE --speculative-draft-model-path /path/to/draft
 --speculative-num-steps 3 --speculative-eagle-topk 1
 --speculative-num-draft-tokens 4 --disable-overlap-schedule
-~~~
+```
 
 For DFlash, give the supported fixed block width and use full draft KV.
 
-~~~text
+```text
 --speculative-algorithm DFLASH --speculative-draft-model-path /path/to/dflash-draft
 --speculative-num-draft-tokens 16 --disable-overlap-schedule
-~~~
+```
 
 Use the top-level `standalone` or `dflash` section to configure accepted draft
 tokens. This example uses the DFlash section.
 
-~~~json
+```json
 {
   "dflash": {
     "accepted_draft_tokens": 0,
     "acceptance_by_request": {"request-1": [0, 2, 3]}
   }
 }
-~~~
+```
 
 Each count excludes the bonus token and ranges from zero to one less than the
 verify width. Missing or exhausted traces use `accepted_draft_tokens`, which
